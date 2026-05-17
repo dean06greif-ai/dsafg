@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Set
 import uuid
 from datetime import datetime, timezone, timedelta
+from fastapi.responses import JSONResponse
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -116,7 +117,7 @@ async def get_current_user(request: Request) -> User:
 
 # -------------------- Auth routes --------------------
 @api_router.post("/auth/session")
-async def process_session(request: Request, response: Response):
+async def process_session(request: Request):
     body = await request.json()
     session_id = body.get("session_id")
     if not session_id:
@@ -153,7 +154,6 @@ async def process_session(request: Request, response: Response):
             "picture": picture,
             "created_at": now.isoformat(),
         })
-        # default goals
         await db.user_goals.insert_one({
             "user_id": user_id,
             "exercises": [dict(e) for e in DEFAULT_EXERCISES],
@@ -170,16 +170,25 @@ async def process_session(request: Request, response: Response):
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
 
-    response.set_cookie(
-        key="session_token",
-        value=session_token,
-        httponly=True,
-        secure=True,
-        samesite="none",
-        path="/",
-        max_age=7 * 24 * 3600,
-    )
-    return {"user_id": user_id, "email": email, "name": name, "picture": picture}
+response = JSONResponse({
+    "user_id": user_id,
+    "email": email,
+    "name": name,
+    "picture": picture
+})
+
+response.set_cookie(
+    key="session_token",
+    value=session_token,
+    httponly=True,
+    secure=True,
+    samesite="none",
+    path="/",
+    max_age=7 * 24 * 3600,
+)
+
+return response
+
 
 @api_router.get("/auth/me")
 async def me(user: User = Depends(get_current_user)):
