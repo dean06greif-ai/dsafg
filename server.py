@@ -1,0 +1,691 @@
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Cookie, WebSocket, WebSocketDisconnect, Depends
+from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import json
+import logging
+import httpx
+from pathlib import Path
+from pydantic import BaseModel, Field
+from typing import Optional, List, Set
+import uuid
+from datetime import datetime, timezone, timedelta
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+app = FastAPI()
+api_router = APIRouter(prefix="/api")
+
+# -------------------- Models --------------------
+class User(BaseModel):
+    user_id: str
+    email: str
+    name: str
+    picture: Optional[str] = None
+    created_at: datetime
+
+class Exercise(BaseModel):
+    key: str
+    name: str
+    unit: str = ""
+    icon: str = "pushup"
+    color: str = "#CCFF00"
+    base_value: float = 0
+
+class GoalsUpdate(BaseModel):
+    exercises: List[Exercise]
+
+class BoostRequest(BaseModel):
+    exercise_key: str
+
+class ProgressUpdate(BaseModel):
+    week_number: int
+    values: Optional[dict] = None  # legacy: total per exercise
+    days: Optional[dict] = None  # new: {"0".."6": {exercise_key: number}}
+
+class ProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    picture: Optional[str] = None
+
+DEFAULT_EXERCISES = [
+    {"key": "ex1", "name": "Lauf", "unit": "km", "icon": "run", "color": "#CCFF00", "base_value": 10.0},
+    {"key": "ex2", "name": "Liegestütze", "unit": "", "icon": "pushup", "color": "#FF3B30", "base_value": 500},
+    {"key": "ex3", "name": "Klimmzüge", "unit": "", "icon": "pullup", "color": "#00F0FF", "base_value": 50},
+]
+BASE_INCREASE = 0.10
+BOOST_INCREASE = 0.25
+
+# -------------------- WebSocket Manager --------------------
+class ConnectionManager:
+    def __init__(self):
+        self.active: Set[WebSocket] = set()
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active.add(ws)
+
+    def disconnect(self, ws: WebSocket):
+        self.active.discard(ws)
+
+    async def broadcast(self, message: dict):
+        dead = []
+        for ws in self.active:
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.active.discard(ws)
+
+manager = ConnectionManager()
+
+# -------------------- Auth helpers --------------------
+async def get_current_user(request: Request) -> User:
+    token = request.cookies.get("session_token")
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    session = await db.user_sessions.find_one({"session_token": token}, {"_id": 0})
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+    expires_at = session["expires_at"]
+    if isinstance(expires_at, str):
+        expires_at = datetime.fromisoformat(expires_at)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="Session expired")
+
+    user_doc = await db.users.find_one({"user_id": session["user_id"]}, {"_id": 0})
+    if not user_doc:
+        raise HTTPException(status_code=401, detail="User not found")
+    if isinstance(user_doc.get("created_at"), str):
+        user_doc["created_at"] = datetime.fromisoformat(user_doc["created_at"])
+    return User(**user_doc)
+
+# -------------------- Auth routes --------------------
+@api_router.post("/auth/session")
+async def process_session(request: Request, response: Response):
+    body = await request.json()
+    session_id = body.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id required")
+
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        r = await http.get(
+            "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
+            headers={"X-Session-ID": session_id},
+        )
+        if r.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid session_id")
+        data = r.json()
+
+    email = data["email"]
+    name = data.get("name", email)
+    picture = data.get("picture")
+    session_token = data["session_token"]
+
+    existing = await db.users.find_one({"email": email}, {"_id": 0})
+    if existing:
+        user_id = existing["user_id"]
+        await db.users.update_one(
+            {"user_id": user_id},
+            {"$set": {"name": name, "picture": picture}}
+        )
+    else:
+        user_id = f"user_{uuid.uuid4().hex[:12]}"
+        now = datetime.now(timezone.utc)
+        await db.users.insert_one({
+            "user_id": user_id,
+            "email": email,
+            "name": name,
+            "picture": picture,
+            "created_at": now.isoformat(),
+        })
+        # default goals
+        await db.user_goals.insert_one({
+            "user_id": user_id,
+            "exercises": [dict(e) for e in DEFAULT_EXERCISES],
+            "boosts": [],
+            "weekly_increase": BASE_INCREASE,
+            "start_date": now.isoformat(),
+        })
+
+    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    await db.user_sessions.insert_one({
+        "user_id": user_id,
+        "session_token": session_token,
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    response.set_cookie(
+        key="session_token",
+        value=session_token,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/",
+        max_age=7 * 24 * 3600,
+    )
+    return {"user_id": user_id, "email": email, "name": name, "picture": picture}
+
+@api_router.get("/auth/me")
+async def me(user: User = Depends(get_current_user)):
+    return user.model_dump(mode="json")
+
+@api_router.post("/auth/logout")
+async def logout(request: Request, response: Response):
+    token = request.cookies.get("session_token")
+    if token:
+        await db.user_sessions.delete_one({"session_token": token})
+    response.delete_cookie("session_token", path="/", samesite="none", secure=True)
+    return {"ok": True}
+
+# -------------------- Goals --------------------
+def _calc_week_number(start_date: datetime) -> int:
+    """ISO calendar week count. Week 1 = the calendar week (Mo-So) containing start_date.
+    A new week begins every Monday at 00:00."""
+    if start_date.tzinfo is None:
+        start_date = start_date.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    # Anchor each date to the Monday of its ISO week
+    start_monday = (start_date - timedelta(days=start_date.weekday())).date()
+    today_monday = (now - timedelta(days=now.weekday())).date()
+    return max(1, (today_monday - start_monday).days // 7 + 1)
+
+def _round_goal(value: float, unit: str) -> float:
+    """Round goal for clean display. km/distance -> 0.1 (100m). Reps -> nearest 5."""
+    u = (unit or "").lower()
+    if "km" in u or "m" == u or "mi" in u:
+        return round(value, 1)
+    return float(int(round(value / 5.0) * 5))
+
+def _week_goal_for(base_value: float, week: int, boosted_weeks: set) -> float:
+    """Goal at week N = base × 1.10^(N-1) × 1.25^(boost_count_in_weeks_<=N).
+    Each boost adds an extra +25% multiplier on top of the regular +10%/week growth.
+    Boost in current week N immediately raises that week's goal."""
+    base_growth = (1 + BASE_INCREASE) ** (week - 1)
+    boost_count = sum(1 for w in boosted_weeks if w <= week)
+    boost_growth = (1 + BOOST_INCREASE) ** boost_count
+    return base_value * base_growth * boost_growth
+
+async def _load_goals(user_id: str) -> dict:
+    g = await db.user_goals.find_one({"user_id": user_id}, {"_id": 0})
+    now = datetime.now(timezone.utc)
+    if not g:
+        g = {
+            "user_id": user_id,
+            "exercises": [dict(e) for e in DEFAULT_EXERCISES],
+            "boosts": [],
+            "weekly_increase": BASE_INCREASE,
+            "start_date": now.isoformat(),
+        }
+        await db.user_goals.insert_one(dict(g))
+        return g
+    # Migrate legacy schema -> exercises[]
+    if "exercises" not in g:
+        legacy = [
+            {"key": "ex1", "name": "Lauf", "unit": "km", "icon": "run", "color": "#CCFF00", "base_value": float(g.get("base_run_km", 10.0))},
+            {"key": "ex2", "name": "Liegestütze", "unit": "", "icon": "pushup", "color": "#FF3B30", "base_value": float(g.get("base_pushups", 500))},
+            {"key": "ex3", "name": "Klimmzüge", "unit": "", "icon": "pullup", "color": "#00F0FF", "base_value": float(g.get("base_pullups", 50))},
+        ]
+        await db.user_goals.update_one(
+            {"user_id": user_id},
+            {"$set": {"exercises": legacy, "boosts": g.get("boosts", [])},
+             "$unset": {"base_run_km": "", "base_pushups": "", "base_pullups": ""}},
+        )
+        g["exercises"] = legacy
+        g["boosts"] = g.get("boosts", [])
+    if "boosts" not in g:
+        g["boosts"] = []
+        await db.user_goals.update_one({"user_id": user_id}, {"$set": {"boosts": []}})
+    return g
+
+def _boosted_weeks_for(g: dict, exercise_key: str) -> set:
+    return {b["week_number"] for b in g.get("boosts", []) if b.get("exercise_key") == exercise_key}
+
+@api_router.get("/goals/me")
+async def get_my_goals(user: User = Depends(get_current_user)):
+    g = await _load_goals(user.user_id)
+    return g
+
+@api_router.put("/goals/me")
+async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current_user)):
+    await _load_goals(user.user_id)
+    if not (3 <= len(payload.exercises) <= 5):
+        raise HTTPException(status_code=400, detail="Es müssen 3 bis 5 Übungen sein")
+    # ensure unique keys
+    keys = [e.key for e in payload.exercises]
+    if len(set(keys)) != len(keys):
+        raise HTTPException(status_code=400, detail="Übungs-Keys müssen eindeutig sein")
+    exercises = [e.model_dump() for e in payload.exercises]
+    await db.user_goals.update_one(
+        {"user_id": user.user_id},
+        {"$set": {"exercises": exercises}}
+    )
+    await manager.broadcast({"type": "goals_updated", "user_id": user.user_id})
+    g = await db.user_goals.find_one({"user_id": user.user_id}, {"_id": 0})
+    return g
+
+@api_router.post("/goals/me/reset-start")
+async def reset_start_date(user: User = Depends(get_current_user)):
+    now = datetime.now(timezone.utc).isoformat()
+    await db.user_goals.update_one(
+        {"user_id": user.user_id},
+        {"$set": {"start_date": now}},
+    )
+    await manager.broadcast({"type": "goals_updated", "user_id": user.user_id})
+    g = await db.user_goals.find_one({"user_id": user.user_id}, {"_id": 0})
+    return g
+
+# -------------------- Progress --------------------
+@api_router.get("/progress/me")
+async def my_progress(week: Optional[int] = None, user: User = Depends(get_current_user)):
+    g = await _load_goals(user.user_id)
+    sd = g["start_date"]
+    if isinstance(sd, str):
+        sd = datetime.fromisoformat(sd)
+    target_week = week if week else _calc_week_number(sd)
+    entry = await db.progress_entries.find_one(
+        {"user_id": user.user_id, "week_number": target_week},
+        {"_id": 0},
+    )
+    if not entry:
+        entry = {
+            "user_id": user.user_id,
+            "week_number": target_week,
+            "values": {e["key"]: 0 for e in g["exercises"]},
+            "updated_at": None,
+        }
+    elif "values" not in entry:
+        # legacy migration
+        entry["values"] = {
+            "ex1": entry.get("run_km", 0),
+            "ex2": entry.get("pushups", 0),
+            "ex3": entry.get("pullups", 0),
+        }
+    return entry
+
+@api_router.put("/progress/me")
+async def update_progress(payload: ProgressUpdate, user: User = Depends(get_current_user)):
+    now = datetime.now(timezone.utc).isoformat()
+    days = payload.days or {}
+    # Compute totals from days, or fall back to direct values
+    if days:
+        totals = {}
+        for d, vals in days.items():
+            for k, v in (vals or {}).items():
+                totals[k] = totals.get(k, 0) + (float(v) or 0)
+        values = totals
+    else:
+        values = payload.values or {}
+    doc = {
+        "user_id": user.user_id,
+        "week_number": payload.week_number,
+        "values": values,
+        "days": days,
+        "updated_at": now,
+    }
+    await db.progress_entries.update_one(
+        {"user_id": user.user_id, "week_number": payload.week_number},
+        {"$set": doc, "$unset": {"run_km": "", "pushups": "", "pullups": ""}},
+        upsert=True,
+    )
+    await manager.broadcast({
+        "type": "progress_updated",
+        "user_id": user.user_id,
+        "week_number": payload.week_number,
+        "values": values,
+    })
+    return doc
+
+# -------------------- Live Board (everyone) --------------------
+def _streak_info(exercises, boosts_by_ex, progress_by_week, current_week):
+    """Compute current & best streaks of consecutive completed weeks."""
+    completed = []
+    for w in range(1, current_week + 1):
+        pe = progress_by_week.get(w, {})
+        all_done = True
+        for ex in exercises:
+            bws = boosts_by_ex.get(ex["key"], set())
+            goal = _week_goal_for(ex["base_value"], w, bws)
+            val = pe.get(ex["key"], 0) or 0
+            if val + 1e-9 < goal:
+                all_done = False
+                break
+        if all_done:
+            completed.append(w)
+    completed_set = set(completed)
+    # current streak: trailing run ending at current_week, else at current_week-1
+    cur = 0
+    w = current_week
+    while w in completed_set:
+        cur += 1
+        w -= 1
+    if cur == 0:
+        w = current_week - 1
+        while w in completed_set:
+            cur += 1
+            w -= 1
+    # best streak: longest consecutive run
+    best = 0
+    run = 0
+    prev = None
+    for w in completed:
+        run = run + 1 if prev is not None and w == prev + 1 else 1
+        best = max(best, run)
+        prev = w
+    return {"current": cur, "best": best, "completed_weeks": completed}
+
+@api_router.get("/board")
+async def board(week: Optional[int] = None, user: User = Depends(get_current_user)):
+    users = await db.users.find({}, {"_id": 0}).to_list(100)
+    result = []
+    for u in users:
+        g = await _load_goals(u["user_id"])
+        sd = g["start_date"]
+        if isinstance(sd, str):
+            sd = datetime.fromisoformat(sd)
+        cur_week = week if week else _calc_week_number(sd)
+        boosts_by_ex = {ex["key"]: _boosted_weeks_for(g, ex["key"]) for ex in g["exercises"]}
+        exercises_out = []
+        for ex in g["exercises"]:
+            bws = boosts_by_ex[ex["key"]]
+            goal_val = _week_goal_for(ex["base_value"], cur_week, bws)
+            exercises_out.append({
+                "key": ex["key"],
+                "name": ex["name"],
+                "unit": ex.get("unit", ""),
+                "icon": ex.get("icon", "pushup"),
+                "color": ex.get("color", "#CCFF00"),
+                "goal": _round_goal(goal_val, ex.get("unit", "")),
+                "boosted_this_week": cur_week in bws,
+                "boosted_weeks": sorted(list(bws)),
+            })
+        entry = await db.progress_entries.find_one(
+            {"user_id": u["user_id"], "week_number": cur_week},
+            {"_id": 0},
+        )
+        if entry and "values" not in entry:
+            entry["values"] = {
+                "ex1": entry.get("run_km", 0),
+                "ex2": entry.get("pushups", 0),
+                "ex3": entry.get("pullups", 0),
+            }
+        values = entry["values"] if entry else {e["key"]: 0 for e in g["exercises"]}
+        days = entry.get("days", {}) if entry else {}
+        # Build progress_by_week map for streak calc + totals
+        all_entries = await db.progress_entries.find(
+            {"user_id": u["user_id"]}, {"_id": 0}
+        ).to_list(1000)
+        progress_by_week = {}
+        all_time_totals = {ex["key"]: 0.0 for ex in g["exercises"]}
+        for pe in all_entries:
+            wn = pe.get("week_number")
+            if "values" in pe:
+                progress_by_week[wn] = pe["values"]
+            else:
+                progress_by_week[wn] = {
+                    "ex1": pe.get("run_km", 0),
+                    "ex2": pe.get("pushups", 0),
+                    "ex3": pe.get("pullups", 0),
+                }
+            for k, v in progress_by_week[wn].items():
+                if k in all_time_totals:
+                    all_time_totals[k] += float(v or 0)
+        streak = _streak_info(g["exercises"], boosts_by_ex, progress_by_week, cur_week)
+        # Detect streak changes vs stored last_streak (for WebSocket notifications)
+        last_streak = int(g.get("last_streak", 0))
+        cur_streak = int(streak["current"])
+        if cur_streak != last_streak:
+            if cur_streak > last_streak:
+                await manager.broadcast({
+                    "type": "week_completed",
+                    "user_id": u["user_id"],
+                    "user_name": u["name"],
+                    "week_number": cur_week,
+                    "streak": cur_streak,
+                })
+            elif last_streak > 0 and cur_streak == 0:
+                await manager.broadcast({
+                    "type": "streak_ended",
+                    "user_id": u["user_id"],
+                    "user_name": u["name"],
+                    "previous_streak": last_streak,
+                })
+            await db.user_goals.update_one(
+                {"user_id": u["user_id"]},
+                {"$set": {"last_streak": cur_streak}},
+            )
+        result.append({
+            "user_id": u["user_id"],
+            "name": u["name"],
+            "email": u["email"],
+            "picture": u.get("picture"),
+            "week_number": cur_week,
+            "exercises": exercises_out,
+            "values": values,
+            "days": days,
+            "updated_at": entry.get("updated_at") if entry else None,
+            "streak": streak,
+            "all_time": {k: round(v, 2) for k, v in all_time_totals.items()},
+        })
+    return {"week_number": week, "users": result}
+
+# -------------------- Boost --------------------
+@api_router.post("/boost")
+async def boost_exercise(payload: BoostRequest, user: User = Depends(get_current_user)):
+    g = await _load_goals(user.user_id)
+    sd = g["start_date"]
+    if isinstance(sd, str):
+        sd = datetime.fromisoformat(sd)
+    cur_week = _calc_week_number(sd)
+    # validate exercise key
+    if not any(e["key"] == payload.exercise_key for e in g["exercises"]):
+        raise HTTPException(status_code=400, detail="Unknown exercise")
+    # max 1 boost per user per week (across exercises)
+    if any(b["week_number"] == cur_week for b in g.get("boosts", [])):
+        raise HTTPException(status_code=400, detail="Du hast diese Woche bereits geboostet")
+    new_boost = {
+        "exercise_key": payload.exercise_key,
+        "week_number": cur_week,
+        "applied_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.user_goals.update_one(
+        {"user_id": user.user_id},
+        {"$push": {"boosts": new_boost}},
+    )
+    await manager.broadcast({
+        "type": "boost_applied",
+        "user_id": user.user_id,
+        "user_name": user.name,
+        "exercise_key": payload.exercise_key,
+        "week_number": cur_week,
+    })
+    return {"ok": True, "boost": new_boost}
+
+@api_router.delete("/boost")
+async def cancel_boost(user: User = Depends(get_current_user)):
+    g = await _load_goals(user.user_id)
+    sd = g["start_date"]
+    if isinstance(sd, str):
+        sd = datetime.fromisoformat(sd)
+    cur_week = _calc_week_number(sd)
+    boosts = g.get("boosts", [])
+    target = next((b for b in boosts if b["week_number"] == cur_week), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Kein aktiver Boost diese Woche")
+    await db.user_goals.update_one(
+        {"user_id": user.user_id},
+        {"$pull": {"boosts": {"week_number": cur_week}}},
+    )
+    await manager.broadcast({
+        "type": "boost_canceled",
+        "user_id": user.user_id,
+        "user_name": user.name,
+        "exercise_key": target["exercise_key"],
+        "week_number": cur_week,
+    })
+    return {"ok": True}
+
+@api_router.get("/boost/ranking")
+async def boost_ranking(user: User = Depends(get_current_user)):
+    users = await db.users.find({}, {"_id": 0}).to_list(100)
+    ranking = []
+    for u in users:
+        g = await _load_goals(u["user_id"])
+        boosts = g.get("boosts", [])
+        by_ex = {}
+        for b in boosts:
+            by_ex[b["exercise_key"]] = by_ex.get(b["exercise_key"], 0) + 1
+        # map exercise key to current name
+        ex_map = {e["key"]: e["name"] for e in g["exercises"]}
+        ranking.append({
+            "user_id": u["user_id"],
+            "name": u["name"],
+            "picture": u.get("picture"),
+            "total_boosts": len(boosts),
+            "by_exercise": [
+                {"key": k, "name": ex_map.get(k, k), "count": v}
+                for k, v in by_ex.items()
+            ],
+            "latest_boost": boosts[-1] if boosts else None,
+        })
+    ranking.sort(key=lambda x: x["total_boosts"], reverse=True)
+    return {"ranking": ranking}
+
+# -------------------- Profile --------------------
+@api_router.put("/profile")
+async def update_profile(payload: ProfileUpdate, user: User = Depends(get_current_user)):
+    update = {}
+    if payload.name is not None and payload.name.strip():
+        update["name"] = payload.name.strip()[:80]
+    if payload.picture is not None:
+        # accept data: URL or http(s) URL; cap size at ~500KB
+        p = payload.picture
+        if len(p) > 700_000:
+            raise HTTPException(status_code=400, detail="Bild zu groß (max ~500KB)")
+        update["picture"] = p
+    if not update:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+    await db.users.update_one({"user_id": user.user_id}, {"$set": update})
+    await manager.broadcast({"type": "profile_updated", "user_id": user.user_id})
+    updated = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
+    return updated
+
+# -------------------- Insights (Power-Day) --------------------
+@api_router.get("/insights/me")
+async def insights_me(user: User = Depends(get_current_user)):
+    g = await _load_goals(user.user_id)
+    exercises = g["exercises"]
+    entries = await db.progress_entries.find({"user_id": user.user_id}, {"_id": 0}).to_list(1000)
+
+    by_weekday = {ex["key"]: [0.0] * 7 for ex in exercises}
+    weeks_active = {ex["key"]: [0] * 7 for ex in exercises}  # weeks where user trained on this weekday
+    weeks_with_data = 0
+
+    for entry in entries:
+        days = entry.get("days") or {}
+        if not days:
+            # Legacy total-only entry: skip (no daily breakdown)
+            continue
+        weeks_with_data += 1
+        active_today = {ex["key"]: [False] * 7 for ex in exercises}
+        for d_str, vals in days.items():
+            try:
+                d = int(d_str)
+            except (ValueError, TypeError):
+                continue
+            if d < 0 or d > 6 or not isinstance(vals, dict):
+                continue
+            for k, v in vals.items():
+                if k not in by_weekday:
+                    continue
+                try:
+                    fv = float(v or 0)
+                except (ValueError, TypeError):
+                    fv = 0.0
+                if fv > 0:
+                    by_weekday[k][d] += fv
+                    active_today[k][d] = True
+        for k, flags in active_today.items():
+            for i, was_active in enumerate(flags):
+                if was_active:
+                    weeks_active[k][i] += 1
+
+    out = []
+    for ex in exercises:
+        k = ex["key"]
+        totals = [round(v, 2) for v in by_weekday[k]]
+        total_sum = sum(totals)
+        nonzero = [(i, v) for i, v in enumerate(totals) if v > 0]
+        power_day = max(nonzero, key=lambda x: x[1])[0] if nonzero else None
+        weakest_day = min(nonzero, key=lambda x: x[1])[0] if nonzero else None
+        share_per_day = [round(100 * t / total_sum, 1) if total_sum > 0 else 0 for t in totals]
+        consistency = [round(100 * wa / weeks_with_data) if weeks_with_data > 0 else 0 for wa in weeks_active[k]]
+        avg = round(total_sum / weeks_with_data, 2) if weeks_with_data > 0 else 0
+        out.append({
+            "key": k,
+            "name": ex["name"],
+            "unit": ex.get("unit", ""),
+            "icon": ex.get("icon", "pushup"),
+            "color": ex.get("color", "#CCFF00"),
+            "by_weekday": totals,
+            "share_per_day": share_per_day,
+            "consistency": consistency,
+            "power_day": power_day,
+            "weakest_day": weakest_day,
+            "total": round(total_sum, 2),
+            "avg_per_week": avg,
+        })
+
+    return {"exercises": out, "weeks_tracked": weeks_with_data}
+
+# -------------------- WebSocket --------------------
+@api_router.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception:
+        manager.disconnect(websocket)
+
+@api_router.get("/")
+async def root():
+    return {"message": "NeonTracker API"}
+
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="localhost", port=5000)
