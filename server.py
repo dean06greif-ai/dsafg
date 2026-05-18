@@ -445,7 +445,7 @@ def _streak_info(exercises, boosts_by_ex, progress_by_week, current_week):
         all_done = True
         for ex in exercises:
             bws = boosts_by_ex.get(ex["key"], set())
-            goal = _week_goal_for(ex["base_value"], w, bws)
+            goal = _round_goal(_week_goal_for(ex["base_value"], w, bws), ex.get("unit", ""))
             val = pe.get(ex["key"], 0) or 0
             if val + 1e-9 < goal:
                 all_done = False
