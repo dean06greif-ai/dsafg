@@ -54,6 +54,8 @@ class ProfileUpdate(BaseModel):
     name: Optional[str] = None
     picture: Optional[str] = None
 
+class AuthPreferencesUpdate(BaseModel):
+    remember_me: bool
 DEFAULT_EXERCISES = [
     {"key": "ex1", "name": "Lauf", "unit": "km", "icon": "run", "color": "#CCFF00", "base_value": 10.0},
     {"key": "ex2", "name": "Liegestütze", "unit": "", "icon": "pushup", "color": "#FF3B30", "base_value": 500},
@@ -116,6 +118,7 @@ async def get_current_user(request: Request) -> User:
     return User(**user_doc)
 
 # -------------------- Auth routes --------------------
+
 @api_router.post("/auth/session")
 async def process_session(request: Request, response: Response):
     body = await request.json()
@@ -138,8 +141,10 @@ async def process_session(request: Request, response: Response):
     session_token = data["session_token"]
 
     existing = await db.users.find_one({"email": email}, {"_id": 0})
+    remember_me = True  # Default für neue User
     if existing:
         user_id = existing["user_id"]
+        remember_me = existing.get("remember_me", True)
         await db.users.update_one(
             {"user_id": user_id},
             {"$set": {"name": name, "picture": picture}}
@@ -153,6 +158,7 @@ async def process_session(request: Request, response: Response):
             "name": name,
             "picture": picture,
             "created_at": now.isoformat(),
+            "remember_me": True,
         })
         # default goals
         await db.user_goals.insert_one({
@@ -163,7 +169,15 @@ async def process_session(request: Request, response: Response):
             "start_date": now.isoformat(),
         })
 
-    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    # Session-Dauer abhängig von remember_me
+    if remember_me:
+        session_days = 30
+        cookie_max_age = 30 * 24 * 3600
+    else:
+        session_days = 1
+        cookie_max_age = None  # Session-Cookie (Browser-Close => weg)
+
+    expires_at = datetime.now(timezone.utc) + timedelta(days=session_days)
     await db.user_sessions.insert_one({
         "user_id": user_id,
         "session_token": session_token,
@@ -178,13 +192,36 @@ async def process_session(request: Request, response: Response):
         secure=True,
         samesite="none",
         path="/",
-        max_age=7 * 24 * 3600,
+        max_age=cookie_max_age,
     )
     return {"user_id": user_id, "email": email, "name": name, "picture": picture}
 
 
 @api_router.get("/auth/me")
-async def me(user: User = Depends(get_current_user)):
+async def me(request: Request, response: Response, user: User = Depends(get_current_user)):
+    # Sliding session: bei aktiven Nutzern Session automatisch verlängern
+    user_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
+    if user_doc and user_doc.get("remember_me", True):
+        token = request.cookies.get("session_token")
+        if not token:
+            auth = request.headers.get("Authorization", "")
+            if auth.startswith("Bearer "):
+                token = auth[7:]
+        if token:
+            new_expires = datetime.now(timezone.utc) + timedelta(days=30)
+            await db.user_sessions.update_one(
+                {"session_token": token},
+                {"$set": {"expires_at": new_expires.isoformat()}}
+            )
+            response.set_cookie(
+                key="session_token",
+                value=token,
+                httponly=True,
+                secure=True,
+                samesite="none",
+                path="/",
+                max_age=30 * 24 * 3600,
+            )
     return user.model_dump(mode="json")
 
 @api_router.post("/auth/logout")
@@ -195,6 +232,52 @@ async def logout(request: Request, response: Response):
     response.delete_cookie("session_token", path="/", samesite="none", secure=True)
     return {"ok": True}
 
+
+@api_router.get("/auth/preferences")
+async def get_auth_prefs(user: User = Depends(get_current_user)):
+    user_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
+    return {"remember_me": bool(user_doc.get("remember_me", True)) if user_doc else True}
+
+
+@api_router.put("/auth/preferences")
+async def set_auth_prefs(
+    payload: AuthPreferencesUpdate,
+    request: Request,
+    response: Response,
+    user: User = Depends(get_current_user),
+):
+    await db.users.update_one(
+        {"user_id": user.user_id},
+        {"$set": {"remember_me": payload.remember_me}}
+    )
+
+    token = request.cookies.get("session_token")
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+
+    if token:
+        if payload.remember_me:
+            new_expires = datetime.now(timezone.utc) + timedelta(days=30)
+            cookie_max_age = 30 * 24 * 3600
+        else:
+            new_expires = datetime.now(timezone.utc) + timedelta(days=1)
+            cookie_max_age = None  # Session-Cookie
+        await db.user_sessions.update_one(
+            {"session_token": token},
+            {"$set": {"expires_at": new_expires.isoformat()}}
+        )
+        response.set_cookie(
+            key="session_token",
+            value=token,
+            httponly=True,
+            secure=True,
+            samesite="none",
+            path="/",
+            max_age=cookie_max_age,
+        )
+    return {"remember_me": payload.remember_me}
 # -------------------- Goals --------------------
 def _calc_week_number(start_date: datetime) -> int:
     """ISO calendar week count. Week 1 = the calendar week (Mo-So) containing start_date.
