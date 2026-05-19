@@ -63,6 +63,7 @@ DEFAULT_EXERCISES = [
 ]
 BASE_INCREASE = 0.10
 BOOST_INCREASE = 0.25
+FUTURE_WEEKS = 10  # how many future weeks to project in /goals/me progression
 
 # -------------------- WebSocket Manager --------------------
 class ConnectionManager:
@@ -297,14 +298,6 @@ def _round_goal(value: float, unit: str) -> float:
         return round(value, 1)
     return float(int(round(value / 5.0) * 5))
 
-def _week_goal_for(base_value: float, week: int, boosted_weeks: set) -> float:
-    """Goal at week N = base × 1.10^(N-1) × 1.25^(boost_count_in_weeks_<=N).
-    Each boost adds an extra +25% multiplier on top of the regular +10%/week growth.
-    Boost in current week N immediately raises that week's goal."""
-    base_growth = (1 + BASE_INCREASE) ** (week - 1)
-    boost_count = sum(1 for w in boosted_weeks if w <= week)
-    boost_growth = (1 + BOOST_INCREASE) ** boost_count
-    return base_value * base_growth * boost_growth
 
 async def _load_goals(user_id: str) -> dict:
     g = await db.user_goals.find_one({"user_id": user_id}, {"_id": 0})
@@ -341,9 +334,142 @@ async def _load_goals(user_id: str) -> dict:
 def _boosted_weeks_for(g: dict, exercise_key: str) -> set:
     return {b["week_number"] for b in g.get("boosts", []) if b.get("exercise_key") == exercise_key}
 
+
+async def _progress_by_week(user_id: str, exercises: list) -> dict:
+    """Returns dict {week_number: {exercise_key: total_logged_value}}."""
+    entries = await db.progress_entries.find({"user_id": user_id}, {"_id": 0}).to_list(1000)
+    out = {}
+    ex_keys = {e["key"] for e in exercises}
+    for pe in entries:
+        wn = pe.get("week_number")
+        if wn is None:
+            continue
+        if "values" in pe:
+            out[wn] = {k: float(v or 0) for k, v in pe["values"].items() if k in ex_keys}
+        else:
+            # legacy
+            legacy = {
+                "ex1": float(pe.get("run_km", 0) or 0),
+                "ex2": float(pe.get("pushups", 0) or 0),
+                "ex3": float(pe.get("pullups", 0) or 0),
+            }
+            out[wn] = {k: v for k, v in legacy.items() if k in ex_keys}
+    return out
+
+
+def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week: dict,
+                          current_week: int, future_weeks: int = FUTURE_WEEKS) -> dict:
+    """Compute per-week progression for a single exercise.
+
+    Rules:
+      • Each completed past week → +10% progression carries forward.
+      • Missed past week (logged < goal) → +10% paused for that week (no carry-forward).
+      • Boosts in week W add +25% multiplicatively from week W onwards.
+      • If any week is missed, ALL boosts on this exercise from prior or that week
+        are voided (no longer count anywhere).
+      • For weeks > current_week, we project assuming user completes them (no missed),
+        carrying forward whatever boosts survived up to current_week.
+
+    Returns:
+        {
+          "missed_weeks": [..],
+          "effective_boost_weeks": [..],   # boosts still active at/after current week
+          "current_goal": float,           # rounded current week goal
+          "progression": [
+            {"week", "goal", "status", "boost", "voided_boost"}, ...
+          ]
+        }
+    """
+    base = float(exercise.get("base_value", 0) or 0)
+    unit = exercise.get("unit", "")
+    ex_key = exercise["key"]
+
+    eff_idx = 0           # +10% multipliers applied so far
+    active_boosts = []    # list of boost weeks still effective
+    missed = []
+    progression = []
+
+    last_week = max(current_week, 1) + future_weeks
+
+    for w in range(1, last_week + 1):
+        # Apply boost made this week (before computing this week's goal)
+        boost_this_week = w in all_boost_weeks
+        if boost_this_week:
+            active_boosts.append(w)
+
+        goal_raw = base * ((1 + BASE_INCREASE) ** eff_idx) * ((1 + BOOST_INCREASE) ** len(active_boosts))
+        goal_rounded = _round_goal(goal_raw, unit)
+
+        if w < current_week:
+            logged = float(progress_by_week.get(w, {}).get(ex_key, 0) or 0)
+            if logged + 1e-9 < goal_rounded:
+                # MISSED
+                missed.append(w)
+                # Void all boosts up to and including this week (boost "fliegt raus")
+                active_boosts = [b for b in active_boosts if b > w]
+                status = "missed"
+                voided_boost = boost_this_week  # boost this week is also voided
+            else:
+                status = "completed"
+                voided_boost = False
+                eff_idx += 1
+        elif w == current_week:
+            status = "current"
+            voided_boost = False
+            # Note: do NOT increment eff_idx here; current week's success is unknown.
+            # The projection for w+1 below uses (eff_idx + 1) assuming user completes it.
+        else:
+            # future weeks: assume completion. Increment eff_idx AFTER computing this week.
+            status = "future"
+            voided_boost = False
+
+        progression.append({
+            "week": w,
+            "goal": goal_rounded,
+            "status": status,
+            "boost": boost_this_week,
+            "voided_boost": voided_boost,
+        })
+
+        # For future weeks (status="future") we assume completion → carry +10%
+        if status == "future":
+            eff_idx += 1
+        # For the current week, the projection of next week assumes completion → carry +10%
+        elif status == "current":
+            eff_idx += 1
+
+    # Find current week's entry for current_goal
+    current_goal = next((p["goal"] for p in progression if p["week"] == current_week), 0)
+
+    return {
+        "missed_weeks": missed,
+        "effective_boost_weeks": sorted(active_boosts),
+        "current_goal": current_goal,
+        "progression": progression,
+    }
+
+
+async def _compute_user_state(user_id: str, g: dict, current_week: int) -> dict:
+    """Returns per-exercise progression bundle (see _compute_progression)."""
+    exercises = g["exercises"]
+    progress_by_week = await _progress_by_week(user_id, exercises)
+    state = {}
+    for ex in exercises:
+        bws = _boosted_weeks_for(g, ex["key"])
+        state[ex["key"]] = _compute_progression(ex, bws, progress_by_week, current_week)
+    return state
+
+
 @api_router.get("/goals/me")
 async def get_my_goals(user: User = Depends(get_current_user)):
     g = await _load_goals(user.user_id)
+    sd = g["start_date"]
+    if isinstance(sd, str):
+        sd = datetime.fromisoformat(sd)
+    cur_week = _calc_week_number(sd)
+    state = await _compute_user_state(user.user_id, g, cur_week)
+    g["current_week"] = cur_week
+    g["state"] = state  # per-exercise progression bundle
     return g
 
 @api_router.put("/goals/me")
@@ -437,34 +563,37 @@ async def update_progress(payload: ProgressUpdate, user: User = Depends(get_curr
     return doc
 
 # -------------------- Live Board (everyone) --------------------
-def _streak_info(exercises, boosts_by_ex, progress_by_week, current_week):
-    """Compute current & best streaks of consecutive completed weeks."""
+def _streak_info(state: dict, exercises: list, progress_by_week: dict, current_week: int):
+    """A week is 'completed' for streak purposes if every exercise's logged
+    value reached that exercise's at-time goal (i.e. week not in missed list)."""
+    missed_union = set()
+    for ex in exercises:
+        for w in state[ex["key"]]["missed_weeks"]:
+            missed_union.add(w)
+
     completed = []
-    for w in range(1, current_week + 1):
-        pe = progress_by_week.get(w, {})
+    for w in range(1, current_week):  # only past weeks contribute to completion
+        if w in missed_union:
+            continue
+        # Also require: actually has any logged data for w (otherwise treat as 0 = not completed)
+        # Determine that by checking that the user logged values >= goal for every exercise.
         all_done = True
         for ex in exercises:
-            bws = boosts_by_ex.get(ex["key"], set())
-            goal = _round_goal(_week_goal_for(ex["base_value"], w, bws), ex.get("unit", ""))
-            val = pe.get(ex["key"], 0) or 0
-            if val + 1e-9 < goal:
+            prog = state[ex["key"]]["progression"]
+            target = next((p["goal"] for p in prog if p["week"] == w), None)
+            logged = float(progress_by_week.get(w, {}).get(ex["key"], 0) or 0)
+            if target is None or logged + 1e-9 < target:
                 all_done = False
                 break
         if all_done:
             completed.append(w)
+
     completed_set = set(completed)
-    # current streak: trailing run ending at current_week, else at current_week-1
     cur = 0
-    w = current_week
+    w = current_week - 1
     while w in completed_set:
         cur += 1
         w -= 1
-    if cur == 0:
-        w = current_week - 1
-        while w in completed_set:
-            cur += 1
-            w -= 1
-    # best streak: longest consecutive run
     best = 0
     run = 0
     prev = None
@@ -484,20 +613,21 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
         if isinstance(sd, str):
             sd = datetime.fromisoformat(sd)
         cur_week = week if week else _calc_week_number(sd)
-        boosts_by_ex = {ex["key"]: _boosted_weeks_for(g, ex["key"]) for ex in g["exercises"]}
+        state = await _compute_user_state(u["user_id"], g, cur_week)
+        progress_by_week = await _progress_by_week(u["user_id"], g["exercises"])
         exercises_out = []
         for ex in g["exercises"]:
-            bws = boosts_by_ex[ex["key"]]
-            goal_val = _week_goal_for(ex["base_value"], cur_week, bws)
+            st = state[ex["key"]]
             exercises_out.append({
                 "key": ex["key"],
                 "name": ex["name"],
                 "unit": ex.get("unit", ""),
                 "icon": ex.get("icon", "pushup"),
                 "color": ex.get("color", "#CCFF00"),
-                "goal": _round_goal(goal_val, ex.get("unit", "")),
-                "boosted_this_week": cur_week in bws,
-                "boosted_weeks": sorted(list(bws)),
+                "goal": st["current_goal"],
+                "boosted_this_week": cur_week in st["effective_boost_weeks"],
+                "boosted_weeks": st["effective_boost_weeks"],
+                "missed_weeks": st["missed_weeks"],
             })
         entry = await db.progress_entries.find_one(
             {"user_id": u["user_id"], "week_number": cur_week},
@@ -511,27 +641,12 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
             }
         values = entry["values"] if entry else {e["key"]: 0 for e in g["exercises"]}
         days = entry.get("days", {}) if entry else {}
-        # Build progress_by_week map for streak calc + totals
-        all_entries = await db.progress_entries.find(
-            {"user_id": u["user_id"]}, {"_id": 0}
-        ).to_list(1000)
-        progress_by_week = {}
         all_time_totals = {ex["key"]: 0.0 for ex in g["exercises"]}
-        for pe in all_entries:
-            wn = pe.get("week_number")
-            if "values" in pe:
-                progress_by_week[wn] = pe["values"]
-            else:
-                progress_by_week[wn] = {
-                    "ex1": pe.get("run_km", 0),
-                    "ex2": pe.get("pushups", 0),
-                    "ex3": pe.get("pullups", 0),
-                }
-            for k, v in progress_by_week[wn].items():
+        for wn, vals in progress_by_week.items():
+            for k, v in vals.items():
                 if k in all_time_totals:
                     all_time_totals[k] += float(v or 0)
-        streak = _streak_info(g["exercises"], boosts_by_ex, progress_by_week, cur_week)
-        # Detect streak changes vs stored last_streak (for WebSocket notifications)
+        streak = _streak_info(state, g["exercises"], progress_by_week, cur_week)
         last_streak = int(g.get("last_streak", 0))
         cur_streak = int(streak["current"])
         if cur_streak != last_streak:
@@ -631,22 +746,31 @@ async def boost_ranking(user: User = Depends(get_current_user)):
     ranking = []
     for u in users:
         g = await _load_goals(u["user_id"])
-        boosts = g.get("boosts", [])
+        sd = g["start_date"]
+        if isinstance(sd, str):
+            sd = datetime.fromisoformat(sd)
+        cur_week = _calc_week_number(sd)
+        state = await _compute_user_state(u["user_id"], g, cur_week)
+        # Build effective boost list = boost records whose week is in effective_boost_weeks
+        effective_records = []
+        for b in g.get("boosts", []):
+            ek = b.get("exercise_key")
+            if ek in state and b.get("week_number") in state[ek]["effective_boost_weeks"]:
+                effective_records.append(b)
         by_ex = {}
-        for b in boosts:
+        for b in effective_records:
             by_ex[b["exercise_key"]] = by_ex.get(b["exercise_key"], 0) + 1
-        # map exercise key to current name
         ex_map = {e["key"]: e["name"] for e in g["exercises"]}
         ranking.append({
             "user_id": u["user_id"],
             "name": u["name"],
             "picture": u.get("picture"),
-            "total_boosts": len(boosts),
+            "total_boosts": len(effective_records),
             "by_exercise": [
                 {"key": k, "name": ex_map.get(k, k), "count": v}
                 for k, v in by_ex.items()
             ],
-            "latest_boost": boosts[-1] if boosts else None,
+            "latest_boost": effective_records[-1] if effective_records else None,
         })
     ranking.sort(key=lambda x: x["total_boosts"], reverse=True)
     return {"ranking": ranking}
