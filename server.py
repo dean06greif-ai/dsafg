@@ -61,6 +61,19 @@ DEFAULT_EXERCISES = [
     {"key": "ex2", "name": "Liegestütze", "unit": "", "icon": "pushup", "color": "#FF3B30", "base_value": 500},
     {"key": "ex3", "name": "Klimmzüge", "unit": "", "icon": "pullup", "color": "#00F0FF", "base_value": 50},
 ]
+# Verbindliche Farb-Palette: Position bestimmt Farbe (Ziel 1..5).
+# Ziel 4 = Orange (#FF8800), Ziel 5 = Violett (#A855F7) für deutlichen Kontrast zu Standard-Zielen.
+EXERCISE_PALETTE = ["#CCFF00", "#FF3B30", "#00F0FF", "#FF8800", "#A855F7"]
+
+def _normalize_exercise_colors(exercises: list) -> list:
+    """Erzwingt die Palette-Farbe basierend auf der Position. Mutiert die Liste in-place und gibt sie zurück."""
+    if not exercises:
+        return exercises
+    for idx, ex in enumerate(exercises):
+        if isinstance(ex, dict):
+            ex["color"] = EXERCISE_PALETTE[idx % len(EXERCISE_PALETTE)]
+    return exercises
+
 BASE_INCREASE = 0.10
 BOOST_INCREASE = 0.25
 FUTURE_WEEKS = 10  # how many future weeks to project in /goals/me progression
@@ -329,6 +342,8 @@ async def _load_goals(user_id: str) -> dict:
     if "boosts" not in g:
         g["boosts"] = []
         await db.user_goals.update_one({"user_id": user_id}, {"$set": {"boosts": []}})
+    # Erzwinge Palette-Farbe je nach Position (Ziel 4 = Orange, Ziel 5 = Violett)
+    _normalize_exercise_colors(g.get("exercises", []))
     return g
 
 def _boosted_weeks_for(g: dict, exercise_key: str) -> set:
@@ -482,6 +497,8 @@ async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current
     if len(set(keys)) != len(keys):
         raise HTTPException(status_code=400, detail="Übungs-Keys müssen eindeutig sein")
     exercises = [e.model_dump() for e in payload.exercises]
+    # Farben gemäß Palette normalisieren (verhindert, dass alte Farben aus Frontend übernommen werden)
+    _normalize_exercise_colors(exercises)
     await db.user_goals.update_one(
         {"user_id": user.user_id},
         {"$set": {"exercises": exercises}}
