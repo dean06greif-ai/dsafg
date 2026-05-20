@@ -315,12 +315,14 @@ def _calc_week_number(start_date: datetime) -> int:
     return max(1, (today_monday - start_monday).days // 7 + 1)
 
 def _round_goal(value: float, unit: str) -> float:
-    """Round goal for clean display. km/distance -> 0.1 (100m). Reps -> nearest even number (2)."""
+    """Round goal for clean display. km/distance -> 0.1 (100m). Reps -> nearest integer (half up)."""
     u = (unit or "").lower()
     if "km" in u or "m" == u or "mi" in u:
-        return round(value, 1)
-    # Reps & sonstige Einheiten: auf gerade Zahlen runden (nearest 2)
-    return float(int(round(value / 2.0) * 2))
+        # Half-up Rundung auf 1 Nachkommastelle (vermeidet Python banker's rounding)
+        return float(int(value * 10 + 0.5)) / 10.0
+    # Reps & sonstige Einheiten: auf nächste ganze Zahl runden (half up, nicht banker's)
+    # Wichtig: nicht auf gerade Zahlen runden -> sonst wird 100 + 25% Boost = 125 fälschlich zu 124
+    return float(int(value + 0.5))
 
 
 async def _load_goals(user_id: str) -> dict:
