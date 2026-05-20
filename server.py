@@ -8,7 +8,7 @@ import json
 import logging
 import httpx
 from pathlib import Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Set
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -38,8 +38,16 @@ class Exercise(BaseModel):
     icon: str = "pushup"
     color: str = "#CCFF00"
     base_value: float = 0
-    # NEU: pro Übung anpassbare wöchentliche Steigerung in Prozent (1..10). Default 10.
-    weekly_increase: int = 10
+    progression_pct: int = 10  # 1..10 — individuelle wöchentliche Steigerung in %
+
+    @field_validator("progression_pct")
+    @classmethod
+    def _clamp_progression_pct(cls, v):
+        try:
+            v = int(round(float(v)))
+        except (TypeError, ValueError):
+            v = 10
+        return max(1, min(10, v))
 
 class GoalsUpdate(BaseModel):
     exercises: List[Exercise]
@@ -50,7 +58,7 @@ class BoostRequest(BaseModel):
 class ProgressUpdate(BaseModel):
     week_number: int
     values: Optional[dict] = None  # legacy: total per exercise
-    days: Optional[dict] = None    # new: {"0".."6": {exercise_key: number}}
+    days: Optional[dict] = None  # new: {"0".."6": {exercise_key: number}}
 
 class ProfileUpdate(BaseModel):
     name: Optional[str] = None
@@ -58,16 +66,17 @@ class ProfileUpdate(BaseModel):
 
 class AuthPreferencesUpdate(BaseModel):
     remember_me: bool
-
 DEFAULT_EXERCISES = [
-    {"key": "ex1", "name": "Lauf",        "unit": "km", "icon": "run",    "color": "#CCFF00", "base_value": 10.0, "weekly_increase": 10},
-    {"key": "ex2", "name": "Liegestütze", "unit": "",   "icon": "pushup", "color": "#FF3B30", "base_value": 500,  "weekly_increase": 10},
-    {"key": "ex3", "name": "Klimmzüge",   "unit": "",   "icon": "pullup", "color": "#00F0FF", "base_value": 50,   "weekly_increase": 10},
+    {"key": "ex1", "name": "Lauf", "unit": "km", "icon": "run", "color": "#CCFF00", "base_value": 10.0, "progression_pct": 10},
+    {"key": "ex2", "name": "Liegestütze", "unit": "", "icon": "pushup", "color": "#FF3B30", "base_value": 500, "progression_pct": 10},
+    {"key": "ex3", "name": "Klimmzüge", "unit": "", "icon": "pullup", "color": "#00F0FF", "base_value": 50, "progression_pct": 10},
 ]
 # Verbindliche Farb-Palette: Position bestimmt Farbe (Ziel 1..5).
+# Ziel 4 = Orange (#FF8800), Ziel 5 = Violett (#A855F7) für deutlichen Kontrast zu Standard-Zielen.
 EXERCISE_PALETTE = ["#CCFF00", "#FF3B30", "#00F0FF", "#FF8800", "#A855F7"]
 
 def _normalize_exercise_colors(exercises: list) -> list:
+    """Erzwingt die Palette-Farbe basierend auf der Position. Mutiert die Liste in-place und gibt sie zurück."""
     if not exercises:
         return exercises
     for idx, ex in enumerate(exercises):
@@ -75,24 +84,9 @@ def _normalize_exercise_colors(exercises: list) -> list:
             ex["color"] = EXERCISE_PALETTE[idx % len(EXERCISE_PALETTE)]
     return exercises
 
-def _normalize_weekly_increase(exercises: list) -> list:
-    """Stellt sicher, dass jede Übung weekly_increase als int 1..10 hat (default 10)."""
-    if not exercises:
-        return exercises
-    for ex in exercises:
-        if not isinstance(ex, dict):
-            continue
-        wi = ex.get("weekly_increase", 10)
-        try:
-            wi = int(round(float(wi)))
-        except (TypeError, ValueError):
-            wi = 10
-        ex["weekly_increase"] = max(1, min(10, wi))
-    return exercises
-
-BASE_INCREASE = 0.10           # Default, falls Übung kein eigenes Feld hat (legacy)
-BOOST_INCREASE = 0.25          # Boost bleibt fix +25%
-FUTURE_WEEKS = 10
+BASE_INCREASE = 0.10
+BOOST_INCREASE = 0.25
+FUTURE_WEEKS = 10  # how many future weeks to project in /goals/me progression
 
 # -------------------- WebSocket Manager --------------------
 class ConnectionManager:
@@ -148,7 +142,6 @@ async def get_current_user(request: Request) -> User:
     return User(**user_doc)
 
 # -------------------- Auth routes --------------------
-# (UNVERÄNDERT – identisch zu deinem Original)
 
 @api_router.post("/auth/session")
 async def process_session(request: Request, response: Response):
@@ -162,9 +155,9 @@ async def process_session(request: Request, response: Response):
             "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
             headers={"X-Session-ID": session_id},
         )
-    if r.status_code != 200:
-        raise HTTPException(status_code=401, detail="Invalid session_id")
-    data = r.json()
+        if r.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid session_id")
+        data = r.json()
 
     email = data["email"]
     name = data.get("name", email)
@@ -172,7 +165,7 @@ async def process_session(request: Request, response: Response):
     session_token = data["session_token"]
 
     existing = await db.users.find_one({"email": email}, {"_id": 0})
-    remember_me = True
+    remember_me = True  # Default für neue User
     if existing:
         user_id = existing["user_id"]
         remember_me = existing.get("remember_me", True)
@@ -191,20 +184,22 @@ async def process_session(request: Request, response: Response):
             "created_at": now.isoformat(),
             "remember_me": True,
         })
+        # default goals
         await db.user_goals.insert_one({
             "user_id": user_id,
             "exercises": [dict(e) for e in DEFAULT_EXERCISES],
             "boosts": [],
-            "weekly_increase": BASE_INCREASE,  # legacy global default
+            "weekly_increase": BASE_INCREASE,
             "start_date": now.isoformat(),
         })
 
+    # Session-Dauer abhängig von remember_me
     if remember_me:
         session_days = 30
         cookie_max_age = 30 * 24 * 3600
     else:
         session_days = 1
-        cookie_max_age = None
+        cookie_max_age = None  # Session-Cookie (Browser-Close => weg)
 
     expires_at = datetime.now(timezone.utc) + timedelta(days=session_days)
     await db.user_sessions.insert_one({
@@ -225,8 +220,10 @@ async def process_session(request: Request, response: Response):
     )
     return {"user_id": user_id, "email": email, "name": name, "picture": picture}
 
+
 @api_router.get("/auth/me")
 async def me(request: Request, response: Response, user: User = Depends(get_current_user)):
+    # Sliding session: bei aktiven Nutzern Session automatisch verlängern
     user_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
     if user_doc and user_doc.get("remember_me", True):
         token = request.cookies.get("session_token")
@@ -259,10 +256,12 @@ async def logout(request: Request, response: Response):
     response.delete_cookie("session_token", path="/", samesite="none", secure=True)
     return {"ok": True}
 
+
 @api_router.get("/auth/preferences")
 async def get_auth_prefs(user: User = Depends(get_current_user)):
     user_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
     return {"remember_me": bool(user_doc.get("remember_me", True)) if user_doc else True}
+
 
 @api_router.put("/auth/preferences")
 async def set_auth_prefs(
@@ -288,7 +287,7 @@ async def set_auth_prefs(
             cookie_max_age = 30 * 24 * 3600
         else:
             new_expires = datetime.now(timezone.utc) + timedelta(days=1)
-            cookie_max_age = None
+            cookie_max_age = None  # Session-Cookie
         await db.user_sessions.update_one(
             {"session_token": token},
             {"$set": {"expires_at": new_expires.isoformat()}}
@@ -303,21 +302,25 @@ async def set_auth_prefs(
             max_age=cookie_max_age,
         )
     return {"remember_me": payload.remember_me}
-
 # -------------------- Goals --------------------
 def _calc_week_number(start_date: datetime) -> int:
+    """ISO calendar week count. Week 1 = the calendar week (Mo-So) containing start_date.
+    A new week begins every Monday at 00:00."""
     if start_date.tzinfo is None:
         start_date = start_date.replace(tzinfo=timezone.utc)
     now = datetime.now(timezone.utc)
+    # Anchor each date to the Monday of its ISO week
     start_monday = (start_date - timedelta(days=start_date.weekday())).date()
     today_monday = (now - timedelta(days=now.weekday())).date()
     return max(1, (today_monday - start_monday).days // 7 + 1)
 
 def _round_goal(value: float, unit: str) -> float:
+    """Round goal for clean display. km/distance -> 0.1 (100m). Reps -> nearest 5."""
     u = (unit or "").lower()
     if "km" in u or "m" == u or "mi" in u:
         return round(value, 1)
     return float(int(round(value / 5.0) * 5))
+
 
 async def _load_goals(user_id: str) -> dict:
     g = await db.user_goals.find_one({"user_id": user_id}, {"_id": 0})
@@ -335,13 +338,13 @@ async def _load_goals(user_id: str) -> dict:
     # Migrate legacy schema -> exercises[]
     if "exercises" not in g:
         legacy = [
-            {"key": "ex1", "name": "Lauf",        "unit": "km", "icon": "run",    "color": "#CCFF00", "base_value": float(g.get("base_run_km", 10.0)), "weekly_increase": 10},
-            {"key": "ex2", "name": "Liegestütze", "unit": "",   "icon": "pushup", "color": "#FF3B30", "base_value": float(g.get("base_pushups", 500)),  "weekly_increase": 10},
-            {"key": "ex3", "name": "Klimmzüge",   "unit": "",   "icon": "pullup", "color": "#00F0FF", "base_value": float(g.get("base_pullups", 50)),  "weekly_increase": 10},
+            {"key": "ex1", "name": "Lauf", "unit": "km", "icon": "run", "color": "#CCFF00", "base_value": float(g.get("base_run_km", 10.0))},
+            {"key": "ex2", "name": "Liegestütze", "unit": "", "icon": "pushup", "color": "#FF3B30", "base_value": float(g.get("base_pushups", 500))},
+            {"key": "ex3", "name": "Klimmzüge", "unit": "", "icon": "pullup", "color": "#00F0FF", "base_value": float(g.get("base_pullups", 50))},
         ]
         await db.user_goals.update_one(
             {"user_id": user_id},
-            {"$set":   {"exercises": legacy, "boosts": g.get("boosts", [])},
+            {"$set": {"exercises": legacy, "boosts": g.get("boosts", [])},
              "$unset": {"base_run_km": "", "base_pushups": "", "base_pullups": ""}},
         )
         g["exercises"] = legacy
@@ -349,28 +352,32 @@ async def _load_goals(user_id: str) -> dict:
     if "boosts" not in g:
         g["boosts"] = []
         await db.user_goals.update_one({"user_id": user_id}, {"$set": {"boosts": []}})
-
-    # Erzwinge Palette-Farbe je nach Position
+    # Erzwinge Palette-Farbe je nach Position (Ziel 4 = Orange, Ziel 5 = Violett)
     _normalize_exercise_colors(g.get("exercises", []))
-
-    # NEU: weekly_increase pro Übung sicherstellen + persistieren falls neu hinzugefügt
-    needs_update = False
-    for ex in g.get("exercises", []):
-        if "weekly_increase" not in ex or ex.get("weekly_increase") in (None, ""):
-            ex["weekly_increase"] = 10
-            needs_update = True
-    _normalize_weekly_increase(g.get("exercises", []))
-    if needs_update:
-        await db.user_goals.update_one(
-            {"user_id": user_id},
-            {"$set": {"exercises": g["exercises"]}}
-        )
+    # Stelle sicher, dass jede Übung einen progression_pct (1..10) hat — Default 10
+    _ensure_progression_pct(g.get("exercises", []))
     return g
+
+def _ensure_progression_pct(exercises: list) -> list:
+    """Setzt/clamped das progression_pct-Feld jeder Übung auf einen int in [1, 10]."""
+    if not exercises:
+        return exercises
+    for ex in exercises:
+        if not isinstance(ex, dict):
+            continue
+        try:
+            v = int(round(float(ex.get("progression_pct", 10))))
+        except (TypeError, ValueError):
+            v = 10
+        ex["progression_pct"] = max(1, min(10, v))
+    return exercises
 
 def _boosted_weeks_for(g: dict, exercise_key: str) -> set:
     return {b["week_number"] for b in g.get("boosts", []) if b.get("exercise_key") == exercise_key}
 
+
 async def _progress_by_week(user_id: str, exercises: list) -> dict:
+    """Returns dict {week_number: {exercise_key: total_logged_value}}."""
     entries = await db.progress_entries.find({"user_id": user_id}, {"_id": 0}).to_list(1000)
     out = {}
     ex_keys = {e["key"] for e in exercises}
@@ -381,6 +388,7 @@ async def _progress_by_week(user_id: str, exercises: list) -> dict:
         if "values" in pe:
             out[wn] = {k: float(v or 0) for k, v in pe["values"].items() if k in ex_keys}
         else:
+            # legacy
             legacy = {
                 "ex1": float(pe.get("run_km", 0) or 0),
                 "ex2": float(pe.get("pushups", 0) or 0),
@@ -389,33 +397,51 @@ async def _progress_by_week(user_id: str, exercises: list) -> dict:
             out[wn] = {k: v for k, v in legacy.items() if k in ex_keys}
     return out
 
+
 def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week: dict,
-                         current_week: int, future_weeks: int = FUTURE_WEEKS) -> dict:
-    """
-    Wöchentliche Steigerung kommt jetzt PRO ÜBUNG aus exercise["weekly_increase"] (1..10 in Prozent).
-    Fallback = 10%. Boosts bleiben fix +25%.
+                          current_week: int, future_weeks: int = FUTURE_WEEKS) -> dict:
+    """Compute per-week progression for a single exercise.
+
+    Rules:
+      • Each completed past week → +10% progression carries forward.
+      • Missed past week (logged < goal) → +10% paused for that week (no carry-forward).
+      • Boosts in week W add +25% multiplicatively from week W onwards.
+      • If any week is missed, ALL boosts on this exercise from prior or that week
+        are voided (no longer count anywhere).
+      • For weeks > current_week, we project assuming user completes them (no missed),
+        carrying forward whatever boosts survived up to current_week.
+
+    Returns:
+        {
+          "missed_weeks": [..],
+          "effective_boost_weeks": [..],   # boosts still active at/after current week
+          "current_goal": float,           # rounded current week goal
+          "progression": [
+            {"week", "goal", "status", "boost", "voided_boost"}, ...
+          ]
+        }
     """
     base = float(exercise.get("base_value", 0) or 0)
     unit = exercise.get("unit", "")
     ex_key = exercise["key"]
 
-    # Pro-Übung Steigerung als Multiplikator
-    wi_raw = exercise.get("weekly_increase", 10)
+    # Individuelle wöchentliche Steigerung dieser Übung (Default 10 %, geclamped 1..10)
     try:
-        wi_int = int(round(float(wi_raw)))
+        pct = int(round(float(exercise.get("progression_pct", 10))))
     except (TypeError, ValueError):
-        wi_int = 10
-    wi_int = max(1, min(10, wi_int))
-    ex_increase = wi_int / 100.0
+        pct = 10
+    pct = max(1, min(10, pct))
+    ex_increase = pct / 100.0
 
-    eff_idx = 0
-    active_boosts = []
+    eff_idx = 0           # +x% multipliers applied so far
+    active_boosts = []    # list of boost weeks still effective
     missed = []
     progression = []
 
     last_week = max(current_week, 1) + future_weeks
 
     for w in range(1, last_week + 1):
+        # Apply boost made this week (before computing this week's goal)
         boost_this_week = w in all_boost_weeks
         if boost_this_week:
             active_boosts.append(w)
@@ -426,10 +452,12 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
         if w < current_week:
             logged = float(progress_by_week.get(w, {}).get(ex_key, 0) or 0)
             if logged + 1e-9 < goal_rounded:
+                # MISSED
                 missed.append(w)
+                # Void all boosts up to and including this week (boost "fliegt raus")
                 active_boosts = [b for b in active_boosts if b > w]
                 status = "missed"
-                voided_boost = boost_this_week
+                voided_boost = boost_this_week  # boost this week is also voided
             else:
                 status = "completed"
                 voided_boost = False
@@ -437,7 +465,10 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
         elif w == current_week:
             status = "current"
             voided_boost = False
+            # Note: do NOT increment eff_idx here; current week's success is unknown.
+            # The projection for w+1 below uses (eff_idx + 1) assuming user completes it.
         else:
+            # future weeks: assume completion. Increment eff_idx AFTER computing this week.
             status = "future"
             voided_boost = False
 
@@ -449,11 +480,14 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
             "voided_boost": voided_boost,
         })
 
+        # For future weeks (status="future") we assume completion → carry +10%
         if status == "future":
             eff_idx += 1
+        # For the current week, the projection of next week assumes completion → carry +10%
         elif status == "current":
             eff_idx += 1
 
+    # Find current week's entry for current_goal
     current_goal = next((p["goal"] for p in progression if p["week"] == current_week), 0)
 
     return {
@@ -461,10 +495,11 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
         "effective_boost_weeks": sorted(active_boosts),
         "current_goal": current_goal,
         "progression": progression,
-        "weekly_increase": wi_int,  # explizit zurückgeben für Frontend-Anzeige
     }
 
+
 async def _compute_user_state(user_id: str, g: dict, current_week: int) -> dict:
+    """Returns per-exercise progression bundle (see _compute_progression)."""
     exercises = g["exercises"]
     progress_by_week = await _progress_by_week(user_id, exercises)
     state = {}
@@ -472,6 +507,7 @@ async def _compute_user_state(user_id: str, g: dict, current_week: int) -> dict:
         bws = _boosted_weeks_for(g, ex["key"])
         state[ex["key"]] = _compute_progression(ex, bws, progress_by_week, current_week)
     return state
+
 
 @api_router.get("/goals/me")
 async def get_my_goals(user: User = Depends(get_current_user)):
@@ -482,7 +518,7 @@ async def get_my_goals(user: User = Depends(get_current_user)):
     cur_week = _calc_week_number(sd)
     state = await _compute_user_state(user.user_id, g, cur_week)
     g["current_week"] = cur_week
-    g["state"] = state
+    g["state"] = state  # per-exercise progression bundle
     return g
 
 @api_router.put("/goals/me")
@@ -490,23 +526,15 @@ async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current
     await _load_goals(user.user_id)
     if not (3 <= len(payload.exercises) <= 5):
         raise HTTPException(status_code=400, detail="Es müssen 3 bis 5 Übungen sein")
+    # ensure unique keys
     keys = [e.key for e in payload.exercises]
     if len(set(keys)) != len(keys):
         raise HTTPException(status_code=400, detail="Übungs-Keys müssen eindeutig sein")
     exercises = [e.model_dump() for e in payload.exercises]
-
-    # Validate weekly_increase 1..10 (Integer)
-    for ex in exercises:
-        wi = ex.get("weekly_increase", 10)
-        if not isinstance(wi, int) or wi < 1 or wi > 10:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Wöchentliche Steigerung muss eine ganze Zahl zwischen 1 und 10 sein (Übung '{ex.get('name', ex.get('key'))}')"
-            )
-
+    # Farben gemäß Palette normalisieren (verhindert, dass alte Farben aus Frontend übernommen werden)
     _normalize_exercise_colors(exercises)
-    _normalize_weekly_increase(exercises)
-
+    # progression_pct nochmals normalisieren (Sicherheitsnetz auch wenn Pydantic schon validiert)
+    _ensure_progression_pct(exercises)
     await db.user_goals.update_one(
         {"user_id": user.user_id},
         {"$set": {"exercises": exercises}}
@@ -546,6 +574,7 @@ async def my_progress(week: Optional[int] = None, user: User = Depends(get_curre
             "updated_at": None,
         }
     elif "values" not in entry:
+        # legacy migration
         entry["values"] = {
             "ex1": entry.get("run_km", 0),
             "ex2": entry.get("pushups", 0),
@@ -557,6 +586,7 @@ async def my_progress(week: Optional[int] = None, user: User = Depends(get_curre
 async def update_progress(payload: ProgressUpdate, user: User = Depends(get_current_user)):
     now = datetime.now(timezone.utc).isoformat()
     days = payload.days or {}
+    # Compute totals from days, or fall back to direct values
     if days:
         totals = {}
         for d, vals in days.items():
@@ -585,17 +615,21 @@ async def update_progress(payload: ProgressUpdate, user: User = Depends(get_curr
     })
     return doc
 
-# -------------------- Live Board --------------------
+# -------------------- Live Board (everyone) --------------------
 def _streak_info(state: dict, exercises: list, progress_by_week: dict, current_week: int):
+    """A week is 'completed' for streak purposes if every exercise's logged
+    value reached that exercise's at-time goal (i.e. week not in missed list)."""
     missed_union = set()
     for ex in exercises:
         for w in state[ex["key"]]["missed_weeks"]:
             missed_union.add(w)
 
     completed = []
-    for w in range(1, current_week):
+    for w in range(1, current_week):  # only past weeks contribute to completion
         if w in missed_union:
             continue
+        # Also require: actually has any logged data for w (otherwise treat as 0 = not completed)
+        # Determine that by checking that the user logged values >= goal for every exercise.
         all_done = True
         for ex in exercises:
             prog = state[ex["key"]]["progression"]
@@ -644,8 +678,6 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
                 "icon": ex.get("icon", "pushup"),
                 "color": ex.get("color", "#CCFF00"),
                 "goal": st["current_goal"],
-                # NEU: pro Übung Steigerung wird ans Frontend gespiegelt (auch andere User sehen das)
-                "weekly_increase": int(ex.get("weekly_increase", 10) or 10),
                 "boosted_this_week": cur_week in st["effective_boost_weeks"],
                 "boosted_weeks": st["effective_boost_weeks"],
                 "missed_weeks": st["missed_weeks"],
@@ -713,8 +745,10 @@ async def boost_exercise(payload: BoostRequest, user: User = Depends(get_current
     if isinstance(sd, str):
         sd = datetime.fromisoformat(sd)
     cur_week = _calc_week_number(sd)
+    # validate exercise key
     if not any(e["key"] == payload.exercise_key for e in g["exercises"]):
         raise HTTPException(status_code=400, detail="Unknown exercise")
+    # max 1 boost per user per week (across exercises)
     if any(b["week_number"] == cur_week for b in g.get("boosts", [])):
         raise HTTPException(status_code=400, detail="Du hast diese Woche bereits geboostet")
     new_boost = {
@@ -770,6 +804,7 @@ async def boost_ranking(user: User = Depends(get_current_user)):
             sd = datetime.fromisoformat(sd)
         cur_week = _calc_week_number(sd)
         state = await _compute_user_state(u["user_id"], g, cur_week)
+        # Build effective boost list = boost records whose week is in effective_boost_weeks
         effective_records = []
         for b in g.get("boosts", []):
             ek = b.get("exercise_key")
@@ -800,6 +835,7 @@ async def update_profile(payload: ProfileUpdate, user: User = Depends(get_curren
     if payload.name is not None and payload.name.strip():
         update["name"] = payload.name.strip()[:80]
     if payload.picture is not None:
+        # accept data: URL or http(s) URL; cap size at ~500KB
         p = payload.picture
         if len(p) > 700_000:
             raise HTTPException(status_code=400, detail="Bild zu groß (max ~500KB)")
@@ -811,7 +847,7 @@ async def update_profile(payload: ProfileUpdate, user: User = Depends(get_curren
     updated = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
     return updated
 
-# -------------------- Insights --------------------
+# -------------------- Insights (Power-Day) --------------------
 @api_router.get("/insights/me")
 async def insights_me(user: User = Depends(get_current_user)):
     g = await _load_goals(user.user_id)
@@ -819,12 +855,13 @@ async def insights_me(user: User = Depends(get_current_user)):
     entries = await db.progress_entries.find({"user_id": user.user_id}, {"_id": 0}).to_list(1000)
 
     by_weekday = {ex["key"]: [0.0] * 7 for ex in exercises}
-    weeks_active = {ex["key"]: [0] * 7 for ex in exercises}
+    weeks_active = {ex["key"]: [0] * 7 for ex in exercises}  # weeks where user trained on this weekday
     weeks_with_data = 0
 
     for entry in entries:
         days = entry.get("days") or {}
         if not days:
+            # Legacy total-only entry: skip (no daily breakdown)
             continue
         weeks_with_data += 1
         active_today = {ex["key"]: [False] * 7 for ex in exercises}
