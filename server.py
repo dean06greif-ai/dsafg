@@ -590,9 +590,7 @@ async def reset_start_date(user: User = Depends(get_current_user)):
         ex["progression_last_changed_week"] = 1
     await db.user_goals.update_one(
         {"user_id": user.user_id},
-        {"$set": {"start_date": now, "exercises": exercises, "last_streak": 0,
-                  "last_evaluated_week": 0, "last_current_completed": False,
-                  "pending_events": []}},
+        {"$set": {"start_date": now, "exercises": exercises, "last_streak": 0}},
     )
     # Alte Fortschritts-Einträge & Boosts löschen, damit man wirklich bei Null startet
     await db.progress_entries.delete_many({"user_id": user.user_id})
@@ -666,42 +664,34 @@ async def update_progress(payload: ProgressUpdate, user: User = Depends(get_curr
     return doc
 
 # -------------------- Live Board (everyone) --------------------
-def _week_is_complete(state: dict, exercises: list, progress_by_week: dict, week: int) -> bool:
-    """Returns True iff for `week` every exercise has logged_value >= that-week goal."""
-    for ex in exercises:
-        prog = state[ex["key"]]["progression"]
-        target = next((p["goal"] for p in prog if p["week"] == week), None)
-        logged = float(progress_by_week.get(week, {}).get(ex["key"], 0) or 0)
-        if target is None or logged + 1e-9 < target:
-            return False
-    return True
-
-
 def _streak_info(state: dict, exercises: list, progress_by_week: dict, current_week: int):
     """A week is 'completed' for streak purposes if every exercise's logged
-    value reached that exercise's at-time goal. We count past completed weeks
-    AND include the current week if it is already fully done (mid-week-complete)."""
+    value reached that exercise's at-time goal (i.e. week not in missed list)."""
     missed_union = set()
     for ex in exercises:
         for w in state[ex["key"]]["missed_weeks"]:
             missed_union.add(w)
 
     completed = []
-    for w in range(1, current_week):  # past weeks
+    for w in range(1, current_week):  # only past weeks contribute to completion
         if w in missed_union:
             continue
-        if _week_is_complete(state, exercises, progress_by_week, w):
+        # Also require: actually has any logged data for w (otherwise treat as 0 = not completed)
+        # Determine that by checking that the user logged values >= goal for every exercise.
+        all_done = True
+        for ex in exercises:
+            prog = state[ex["key"]]["progression"]
+            target = next((p["goal"] for p in prog if p["week"] == w), None)
+            logged = float(progress_by_week.get(w, {}).get(ex["key"], 0) or 0)
+            if target is None or logged + 1e-9 < target:
+                all_done = False
+                break
+        if all_done:
             completed.append(w)
 
-    # Include current week if all goals already met
-    current_week_completed = _week_is_complete(state, exercises, progress_by_week, current_week)
-    if current_week_completed:
-        completed.append(current_week)
-
     completed_set = set(completed)
-    # Current streak: count back consecutively from the latest week we know
     cur = 0
-    w = current_week if current_week_completed else current_week - 1
+    w = current_week - 1
     while w in completed_set:
         cur += 1
         w -= 1
@@ -712,12 +702,7 @@ def _streak_info(state: dict, exercises: list, progress_by_week: dict, current_w
         run = run + 1 if prev is not None and w == prev + 1 else 1
         best = max(best, run)
         prev = w
-    return {
-        "current": cur,
-        "best": best,
-        "completed_weeks": completed,
-        "current_week_completed": current_week_completed,
-    }
+    return {"current": cur, "best": best, "completed_weeks": completed}
 
 @api_router.get("/board")
 async def board(week: Optional[int] = None, user: User = Depends(get_current_user)):
@@ -765,67 +750,25 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
         streak = _streak_info(state, g["exercises"], progress_by_week, cur_week)
         last_streak = int(g.get("last_streak", 0))
         cur_streak = int(streak["current"])
-        cur_completed = bool(streak.get("current_week_completed"))
-        last_current_completed = bool(g.get("last_current_completed", False))
-        last_eval_week = int(g.get("last_evaluated_week", 0))
-
-        updates = {}
-
-        # --- Mid-week completion: fire week_completed once when current week flips to done ---
-        if cur_completed and not last_current_completed:
-            await manager.broadcast({
-                "type": "week_completed",
-                "user_id": u["user_id"],
-                "user_name": u["name"],
-                "week_number": cur_week,
-                "streak": cur_streak,
-            })
-            updates["last_current_completed"] = True
-        elif not cur_completed and last_current_completed:
-            # User retracted progress in current week (e.g. corrected a number) → reset flag silently
-            updates["last_current_completed"] = False
-
-        # --- Week rollover: evaluate all weeks between last_evaluated_week+1..cur_week-1 ---
-        # Any of those weeks not completed → store as pending `week_failed` event for that user.
-        # The animation will only fire when the affected user opens the site (via
-        # GET /api/events/pending), NOT via real-time WS — that's intentional so the
-        # animation appears on the *first* page load of the new week.
-        if cur_week > last_eval_week:
-            start_w = max(1, last_eval_week + 1)
-            new_pending = []
-            for w in range(start_w, cur_week):
-                if w not in set(streak["completed_weeks"]):
-                    # Identify which exercises were missed
-                    missed_keys = []
-                    for ex in g["exercises"]:
-                        prog = state[ex["key"]]["progression"]
-                        target = next((p["goal"] for p in prog if p["week"] == w), None)
-                        logged = float(progress_by_week.get(w, {}).get(ex["key"], 0) or 0)
-                        if target is None or logged + 1e-9 < target:
-                            missed_keys.append(ex["key"])
-                    new_pending.append({
-                        "type": "week_failed",
-                        "week_number": w,
-                        "missed_exercises": missed_keys,
-                        "previous_streak": last_streak,
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                    })
-            if new_pending:
-                await db.user_goals.update_one(
-                    {"user_id": u["user_id"]},
-                    {"$push": {"pending_events": {"$each": new_pending}}},
-                )
-            updates["last_evaluated_week"] = cur_week
-            # On rollover the previous-week flag is no longer relevant for the new week
-            updates["last_current_completed"] = cur_completed
-
         if cur_streak != last_streak:
-            updates["last_streak"] = cur_streak
-
-        if updates:
+            if cur_streak > last_streak:
+                await manager.broadcast({
+                    "type": "week_completed",
+                    "user_id": u["user_id"],
+                    "user_name": u["name"],
+                    "week_number": cur_week,
+                    "streak": cur_streak,
+                })
+            elif last_streak > 0 and cur_streak == 0:
+                await manager.broadcast({
+                    "type": "streak_ended",
+                    "user_id": u["user_id"],
+                    "user_name": u["name"],
+                    "previous_streak": last_streak,
+                })
             await db.user_goals.update_one(
                 {"user_id": u["user_id"]},
-                {"$set": updates},
+                {"$set": {"last_streak": cur_streak}},
             )
         result.append({
             "user_id": u["user_id"],
@@ -932,29 +875,6 @@ async def boost_ranking(user: User = Depends(get_current_user)):
         })
     ranking.sort(key=lambda x: x["total_boosts"], reverse=True)
     return {"ranking": ranking}
-
-# -------------------- Pending Events --------------------
-@api_router.get("/events/pending")
-async def get_pending_events(user: User = Depends(get_current_user)):
-    """Return and clear any pending one-shot events for the calling user.
-
-    Used by the frontend on first page load of a new week so that we can fire
-    the WEEK FAILED animation on the actual user that missed a week, *exactly
-    once*, and only when *they themselves* open the site — independent of
-    other users currently browsing or the WebSocket state at rollover time.
-    """
-    g = await db.user_goals.find_one(
-        {"user_id": user.user_id},
-        {"_id": 0, "pending_events": 1},
-    )
-    events = (g or {}).get("pending_events", []) or []
-    if events:
-        await db.user_goals.update_one(
-            {"user_id": user.user_id},
-            {"$set": {"pending_events": []}},
-        )
-    return {"events": events}
-
 
 # -------------------- Profile --------------------
 @api_router.put("/profile")
