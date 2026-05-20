@@ -315,11 +315,12 @@ def _calc_week_number(start_date: datetime) -> int:
     return max(1, (today_monday - start_monday).days // 7 + 1)
 
 def _round_goal(value: float, unit: str) -> float:
-    """Round goal for clean display. km/distance -> 0.1 (100m). Reps -> nearest 5."""
+    """Round goal for clean display. km/distance -> 0.1 (100m). Reps -> nearest even number (2)."""
     u = (unit or "").lower()
     if "km" in u or "m" == u or "mi" in u:
         return round(value, 1)
-    return float(int(round(value / 5.0) * 5))
+    # Reps & sonstige Einheiten: auf gerade Zahlen runden (nearest 2)
+    return float(int(round(value / 2.0) * 2))
 
 
 async def _load_goals(user_id: str) -> dict:
@@ -523,7 +524,7 @@ async def get_my_goals(user: User = Depends(get_current_user)):
 
 @api_router.put("/goals/me")
 async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current_user)):
-    await _load_goals(user.user_id)
+    g = await _load_goals(user.user_id)
     if not (3 <= len(payload.exercises) <= 5):
         raise HTTPException(status_code=400, detail="Es müssen 3 bis 5 Übungen sein")
     # ensure unique keys
@@ -535,6 +536,42 @@ async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current
     _normalize_exercise_colors(exercises)
     # progression_pct nochmals normalisieren (Sicherheitsnetz auch wenn Pydantic schon validiert)
     _ensure_progression_pct(exercises)
+
+    # --- Lock-Regeln: Startwert nach Woche 1 nicht änderbar, Progression nur 1x je 4 Wochen ---
+    sd = g["start_date"]
+    if isinstance(sd, str):
+        sd = datetime.fromisoformat(sd)
+    cur_week = _calc_week_number(sd)
+    PROGRESSION_COOLDOWN = 4  # Wochen
+    old_by_key = {e["key"]: e for e in g.get("exercises", [])}
+    for ex in exercises:
+        old = old_by_key.get(ex["key"])
+        if not old:
+            # Neue Übung -> ab Woche 2 ist Hinzufügen erlaubt, aber merken wann progression "gesetzt" wurde
+            ex["progression_last_changed_week"] = cur_week
+            continue
+        # Startwert nach Woche 1 NICHT änderbar -> erzwinge alten Wert
+        if cur_week > 1:
+            try:
+                if float(ex.get("base_value", 0)) != float(old.get("base_value", 0)):
+                    ex["base_value"] = float(old.get("base_value", 0))
+            except (TypeError, ValueError):
+                ex["base_value"] = float(old.get("base_value", 0))
+        # Progression-Cooldown: in Woche 1 immer frei, sonst nur alle 4 Wochen
+        old_pct = int(old.get("progression_pct", 10))
+        new_pct = int(ex.get("progression_pct", 10))
+        last_changed = int(old.get("progression_last_changed_week", 1))
+        if new_pct != old_pct:
+            if cur_week > 1 and (cur_week - last_changed) < PROGRESSION_COOLDOWN:
+                weeks_left = PROGRESSION_COOLDOWN - (cur_week - last_changed)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Steigerung für '{ex['name']}' kann erst in {weeks_left} Woche(n) wieder angepasst werden",
+                )
+            ex["progression_last_changed_week"] = cur_week
+        else:
+            ex["progression_last_changed_week"] = last_changed
+
     await db.user_goals.update_one(
         {"user_id": user.user_id},
         {"$set": {"exercises": exercises}}
@@ -546,9 +583,20 @@ async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current
 @api_router.post("/goals/me/reset-start")
 async def reset_start_date(user: User = Depends(get_current_user)):
     now = datetime.now(timezone.utc).isoformat()
+    # Hole aktuelle Goals, setze für alle Übungen progression_last_changed_week auf 1
+    g = await db.user_goals.find_one({"user_id": user.user_id}, {"_id": 0})
+    exercises = g.get("exercises", []) if g else []
+    for ex in exercises:
+        ex["progression_last_changed_week"] = 1
     await db.user_goals.update_one(
         {"user_id": user.user_id},
-        {"$set": {"start_date": now}},
+        {"$set": {"start_date": now, "exercises": exercises, "last_streak": 0}},
+    )
+    # Alte Fortschritts-Einträge & Boosts löschen, damit man wirklich bei Null startet
+    await db.progress_entries.delete_many({"user_id": user.user_id})
+    await db.user_goals.update_one(
+        {"user_id": user.user_id},
+        {"$set": {"boosts": []}},
     )
     await manager.broadcast({"type": "goals_updated", "user_id": user.user_id})
     g = await db.user_goals.find_one({"user_id": user.user_id}, {"_id": 0})
