@@ -744,11 +744,44 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
             }
         values = entry["values"] if entry else {e["key"]: 0 for e in g["exercises"]}
         days = entry.get("days", {}) if entry else {}
+        # All-Time-Total: Summe aller geloggten Werte je Übung über ALLE Wochen.
+        # Direkt aus progress_entries lesen (robust gegen fehlende/leere values-Felder).
+        # Quelle-der-Wahrheit-Reihenfolge: days -> values -> legacy.
+        # Nach reset-start ist progress_entries leer => all_time_totals = 0 (automatisch).
         all_time_totals = {ex["key"]: 0.0 for ex in g["exercises"]}
-        for wn, vals in progress_by_week.items():
-            for k, v in vals.items():
+        all_entries = await db.progress_entries.find(
+            {"user_id": u["user_id"]}, {"_id": 0}
+        ).to_list(1000)
+        for pe in all_entries:
+            week_vals = {}
+            pe_days = pe.get("days") or {}
+            if pe_days:
+                # Bevorzugt: aus days aggregieren (source of truth)
+                for d_key, d_vals in pe_days.items():
+                    if not isinstance(d_vals, dict):
+                        continue
+                    for k, v in d_vals.items():
+                        try:
+                            week_vals[k] = week_vals.get(k, 0.0) + float(v or 0)
+                        except (TypeError, ValueError):
+                            continue
+            elif pe.get("values"):
+                # Fallback: aggregiertes values-Feld
+                for k, v in (pe.get("values") or {}).items():
+                    try:
+                        week_vals[k] = float(v or 0)
+                    except (TypeError, ValueError):
+                        continue
+            else:
+                # Legacy-Schema vor exercises[]
+                week_vals = {
+                    "ex1": float(pe.get("run_km", 0) or 0),
+                    "ex2": float(pe.get("pushups", 0) or 0),
+                    "ex3": float(pe.get("pullups", 0) or 0),
+                }
+            for k, v in week_vals.items():
                 if k in all_time_totals:
-                    all_time_totals[k] += float(v or 0)
+                    all_time_totals[k] += v
         streak = _streak_info(state, g["exercises"], progress_by_week, cur_week)
         last_streak = int(g.get("last_streak", 0))
         cur_streak = int(streak["current"])
