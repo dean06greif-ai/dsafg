@@ -935,45 +935,56 @@ async def update_profile(payload: ProfileUpdate, user: User = Depends(get_curren
 async def insights_me(user: User = Depends(get_current_user)):
     g = await _load_goals(user.user_id)
     exercises = g["exercises"]
+    ex_keys = {e["key"] for e in exercises}
     entries = await db.progress_entries.find({"user_id": user.user_id}, {"_id": 0}).to_list(1000)
 
-    by_weekday = {ex["key"]: [0.0] * 7 for ex in exercises}
-    weeks_active = {ex["key"]: [0] * 7 for ex in exercises}  # weeks where user trained on this weekday
+    by_weekday = {k: [0.0] * 7 for k in ex_keys}
+    weeks_active = {k: [0] * 7 for k in ex_keys}  # weeks where user trained on this weekday
     weeks_with_data = 0
 
     for entry in entries:
-        days = entry.get("days") or {}
-        if not days:
-            # Legacy total-only entry: skip (no daily breakdown)
+        raw_days = entry.get("days") or {}
+        if not isinstance(raw_days, dict) or not raw_days:
+            # Legacy total-only entry oder leeres days-Feld: skip
             continue
-        weeks_with_data += 1
-        active_today = {ex["key"]: [False] * 7 for ex in exercises}
-        for d_str, vals in days.items():
+        active_today = {k: [False] * 7 for k in ex_keys}
+        week_contributed = False  # nur Wochen mit >0 Werten als "tracked" zählen
+        for d_key, d_vals in raw_days.items():
+            # Day-Key kann string ("0".."6") oder int sein -> robust parsen
             try:
-                d = int(d_str)
+                d = int(d_key)
             except (ValueError, TypeError):
                 continue
-            if d < 0 or d > 6 or not isinstance(vals, dict):
+            if d < 0 or d > 6 or not isinstance(d_vals, dict):
                 continue
-            for k, v in vals.items():
-                if k not in by_weekday:
+            for k, v in d_vals.items():
+                if k not in ex_keys:
                     continue
                 try:
-                    fv = float(v or 0)
+                    fv = float(v) if v not in (None, "") else 0.0
                 except (ValueError, TypeError):
                     fv = 0.0
                 if fv > 0:
                     by_weekday[k][d] += fv
                     active_today[k][d] = True
-        for k, flags in active_today.items():
-            for i, was_active in enumerate(flags):
-                if was_active:
-                    weeks_active[k][i] += 1
+                    week_contributed = True
+        if week_contributed:
+            weeks_with_data += 1
+            for k, flags in active_today.items():
+                for i, was_active in enumerate(flags):
+                    if was_active:
+                        weeks_active[k][i] += 1
 
     out = []
     for ex in exercises:
         k = ex["key"]
-        totals = [round(v, 2) for v in by_weekday[k]]
+        u = (ex.get("unit", "") or "").lower()
+        is_distance = "km" in u or u == "m" or "mi" in u
+        # Reps -> ganze Zahlen, Distanz -> 0.1 Auflösung (passend zu _round_goal)
+        if is_distance:
+            totals = [round(v, 1) for v in by_weekday[k]]
+        else:
+            totals = [float(int(v + 0.5)) for v in by_weekday[k]]
         total_sum = sum(totals)
         nonzero = [(i, v) for i, v in enumerate(totals) if v > 0]
         power_day = max(nonzero, key=lambda x: x[1])[0] if nonzero else None
