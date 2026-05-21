@@ -721,6 +721,12 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
         exercises_out = []
         for ex in g["exercises"]:
             st = state[ex["key"]]
+            # Individuelle wöchentliche Steigerung dieser Übung (1..10 %)
+            try:
+                _pp = int(round(float(ex.get("progression_pct", 10))))
+            except (TypeError, ValueError):
+                _pp = 10
+            _pp = max(1, min(10, _pp))
             exercises_out.append({
                 "key": ex["key"],
                 "name": ex["name"],
@@ -728,6 +734,7 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
                 "icon": ex.get("icon", "pushup"),
                 "color": ex.get("color", "#CCFF00"),
                 "goal": st["current_goal"],
+                "progression_pct": _pp,
                 "boosted_this_week": cur_week in st["effective_boost_weeks"],
                 "boosted_weeks": st["effective_boost_weeks"],
                 "missed_weeks": st["missed_weeks"],
